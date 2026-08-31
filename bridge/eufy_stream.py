@@ -64,6 +64,11 @@ USER_ID = _decrypt_user_id()
 DISCOVER = "--discover" in sys.argv   # connect, run cmd 9100 -> list NVR ip + cameras (ch,name), write cameras.json, exit
 _carg = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "0"
 CHANNELS = [0, 1, 2, 3] if _carg == "all" else [int(x) for x in _carg.split(",")]
+# getDeviceList (cmd 9100) is broadcast (channel_id 255) and carries no channel list, so
+# CHANNELS never gates discovery. Widen it in --discover mode anyway so the "channels [N]"
+# log line can't be misread as a single-channel restriction while diagnosing.
+if DISCOVER:
+    CHANNELS = [0, 1, 2, 3]
 # --rtsp <url>: publish the H.265 stream to that RTSP url via ffmpeg (go2rtc exec {output} mode).
 RTSP_URL = None
 if "--rtsp" in sys.argv:
@@ -96,6 +101,28 @@ STDOUT_MODE = os.environ.get("EUFY_STDOUT") == "1"   # write clean Annex-B to st
 def now(): return int(time.time())
 def acct(): return hashlib.md5(str(random.random()).encode()).hexdigest()
 def log(*a): print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True, file=sys.stderr)
+
+def _dump_rx(link, buf):
+    """--discover diagnostics: log EVERY inbound reassembled frame verbatim, so a
+    getDeviceList (9100) / dev_list reply is visible even if it arrives under a cmd
+    id or payload shape on_frame() doesn't currently match."""
+    xz = buf[:4] == b"XZYH"
+    off4 = (buf[4] | (buf[5] << 8)) if len(buf) >= 6 else -1   # inbound msg type / outbound envelope
+    chan = buf[12] if len(buf) > 12 else -1
+    payload = buf[16:] if xz else buf
+    split_txt = payload.split(b"\x00")[0].decode("utf-8", "replace")   # what on_frame() sees today
+    j = payload.find(b"{")
+    brace_txt = payload[j:].decode("utf-8", "replace") if j >= 0 else ""
+    log(f"RX link={link} xzyh={xz} off4={off4} chan={chan} len={len(buf)} "
+        f"plen={len(payload)} head={buf[:32].hex()}")
+    if split_txt.strip():
+        log(f"   split-decode: {split_txt[:500]!r}")
+    if brace_txt and brace_txt != split_txt:
+        log(f"   from-brace  : {brace_txt[:900]!r}")
+    low = payload.lower()
+    if any(k in low for k in (b"dev_list", b"devlist", b'"cmd":9100', b'"cmd": 9100',
+                              b'"sn"', b'"name"', b'"ch"', b'"status"', b'"channel"')):
+        log(f"   >>> POSSIBLE DEVICE-LIST FRAME <<< full payload hex:\n{payload.hex()}")
 
 def build_openlive(user_id, channels):
     payload = json.dumps({
@@ -343,6 +370,8 @@ async def main():
         xz = buf[:4] == b"XZYH"
         cmdid = (buf[4] | (buf[5] << 8)) if (xz and len(buf) >= 6) else -1
         payload = buf[16:] if xz else buf
+        if DISCOVER:
+            _dump_rx(link, buf)
         if cmdid in (1300, 1301, 1303):                      # VIDEO: strip 16B XZYH + 22B media hdr -> Annex-B
             nal = payload[22:]
             state["vbytes"] += len(nal); state["vframes"] += 1
@@ -367,19 +396,29 @@ async def main():
         else:                                                # control responses (1351 params, 1003/1004 acks, 9100)
             try: txt = payload.split(b"\x00")[0].decode("utf-8", "replace")
             except Exception: txt = ""
-            if DISCOVER and '"dev_list"' in txt and not state["discovered"]:
-                handle_devlist(txt)
+            _j = payload.find(b"{")
+            cand = payload[_j:].decode("utf-8", "replace") if _j >= 0 else txt
+            _devlist_hit = any(s in cand for s in ('"dev_list"', '"devList"', '"cmd":9100', '"cmd": 9100')) \
+                or '"dev_list"' in txt
+            if DISCOVER and _devlist_hit and not state["discovered"]:
+                handle_devlist(cand)
             else:
-                log(f"CTRL cmd={cmdid} link={link} len={len(buf)} {txt[:170]}")
-            framelog.write(json.dumps({"ctrl": True, "cmd": cmdid, "link": link, "len": len(buf), "txt": txt[:600]}) + "\n"); framelog.flush()
+                log(f"CTRL cmd={cmdid} link={link} len={len(buf)} {(cand or txt)[:300]}")
+            framelog.write(json.dumps({"ctrl": True, "cmd": cmdid, "link": link, "len": len(buf), "txt": (cand or txt)[:600]}) + "\n"); framelog.flush()
     oracle.on_frame = on_frame
 
     def handle_devlist(txt):
         try:
             obj = json.loads(txt)
         except Exception as e:
-            log("devlist parse err:", e); return
-        dl = obj.get("payload", {}).get("dev_list") or obj.get("dev_list") or []
+            log("devlist parse err:", e, "| raw:", repr(txt[:400])); return
+        pl = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        dl = pl.get("dev_list") or pl.get("devList") or obj.get("dev_list") or obj.get("devList") or []
+        if not dl:
+            # Diagnostic: a 9100 reply arrived but carried no devices. Log the whole
+            # object and keep discovery "unfinished" so run.sh retries and we see it again.
+            log(f"9100 reply had NO devices; full obj = {json.dumps(obj)[:800]}")
+            return
         cams = [{"channel": d.get("ch"), "name": d.get("name"), "sn": d.get("sn"),
                  "status": d.get("status"), "dev_type": d.get("dev_type")} for d in dl]
         manifest = {"nvr_sn": STATION_SN, "nvr_ip": state["nvr_ip"], "cameras": cams}
@@ -458,9 +497,10 @@ async def main():
                     log(f"PTCS in on {ch.label}: len={len(b)} head={b[:32].hex()}")
                 oracle.push_recv(b)
             else:
-                # heartbeat (1139 @ off24) or other; log a few
-                if state["ptcs_in"] < 2:
-                    log(f"non-PTCS on {ch.label}: len={len(b)} head={b[:28].hex()}")
+                # heartbeat (1139 @ off24) or other. Log a few normally; log ALL during
+                # discovery in case a 9100 reply comes back raw (not PTCS-framed).
+                if DISCOVER or state["ptcs_in"] < 2:
+                    log(f"non-PTCS on {ch.label}: len={len(b)} head={b[:64].hex()}")
 
     @pc.on("datachannel")
     def on_dc(ch): attach(ch, False)
@@ -518,6 +558,11 @@ async def main():
                     cand = d["value"]
                     if not answered[0] or pc.remoteDescription is None: pending.append(cand)
                     else: await add_cand(cand)
+                elif DISCOVER:
+                    log(f"WS a3 unhandled dataType={inner.get('dataType')!r} "
+                        f"d={json.dumps(d, default=str)[:500]}")
+            elif DISCOVER:
+                log(f"WS unhandled action={action} inner={json.dumps(inner, default=str)[:500]}")
 
         async def discover_watchdog():
             # Discovery completes on the DataChannel (handle_devlist via on_frame), NOT on the
