@@ -65,7 +65,10 @@ RUN if [ ! -e /usr/bin/python ]; then ln -s /usr/bin/python3 /usr/bin/python; fi
 # ---------------------------------------------------------------------------
 ARG REPO_URL="https://github.com/slimz009/Eufy-Home-Assistant"
 ARG REPO_REF="test/local-build"
+# Bump CACHEBUST to force a fresh clone when the branch HEAD moves (local testing only).
+ARG CACHEBUST=1
 RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /tmp/repo \
+    && git -C /tmp/repo rev-parse HEAD \
     && mkdir -p /opt/eufy \
     && cp -r /tmp/repo/bridge /opt/eufy/bridge \
     && rm -rf /tmp/repo
