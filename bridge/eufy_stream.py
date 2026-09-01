@@ -475,15 +475,17 @@ async def main():
         if DISCOVER:
             # cmd 9100 (getDeviceList) is undocumented and this NVR firmware rejects it
             # with error -104. cmd 1103 (openLive / getCameraParams) IS documented to
-            # return a params JSON with camera names and does NOT start video, so try it
-            # first; keep 9100 as a fallback for firmware that supports it.
-            ol = build_openlive(USER_ID, CHANNELS)
-            log(f"-> openLive (1103) len={len(ol)} channels={CHANNELS}  [auto-discovery via getCameraParams]")
-            oracle.push_send(1, ol)
-            await asyncio.sleep(0.4)
-            dl = build_devicelist(USER_ID)
-            log(f"-> getDeviceList (9100) len={len(dl)}  [auto-discovery fallback]")
-            oracle.push_send(1, dl)
+            # return a params JSON with camera names and does NOT start video. Try 1103
+            # with a single channel (the proven streaming default) first, then a 4-channel
+            # 1103, then 9100 -- logging every outgoing frame so we can compare wire bytes.
+            for label, frame in (
+                ("openLive(1103) ch=[0]", build_openlive(USER_ID, [0])),
+                ("openLive(1103) ch=[0,1,2,3]", build_openlive(USER_ID, [0, 1, 2, 3])),
+                ("getDeviceList(9100)", build_devicelist(USER_ID)),
+            ):
+                log(f"-> {label} len={len(frame)} tx={frame[:24].hex()} json={frame[16:].decode('utf-8','replace')[:300]}")
+                oracle.push_send(1, frame)
+                await asyncio.sleep(0.5)
             return
         # openLive (1103) param query, then the REAL trigger startStream (1003).
         ol = build_openlive(USER_ID, CHANNELS)
