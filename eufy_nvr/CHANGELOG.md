@@ -43,7 +43,7 @@
 ## 0.6.2
 
 - Update eufy's required SCTP framing runtime from removed `0_0_1` CDN assets to the current
-  `0_0_2` files used by the web client.
+  `0_0_4` files used by the web client.
 - Fail the add-on image build when those runtime-critical files cannot be downloaded, and run the
   offline SCTP round-trip self-test during the build so a broken image cannot be installed again.
 
