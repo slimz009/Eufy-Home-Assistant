@@ -102,6 +102,24 @@ def now(): return int(time.time())
 def acct(): return hashlib.md5(str(random.random()).encode()).hexdigest()
 def log(*a): print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True, file=sys.stderr)
 
+def _adts_header(payload_len, freq_idx=8, chan=1, aot=2):
+    """7-byte ADTS header for an AAC-LC frame (default: 16 kHz mono)."""
+    flen = 7 + payload_len
+    return bytes([
+        0xFF, 0xF1,
+        ((aot - 1) << 6) | (freq_idx << 2) | (chan >> 2),
+        ((chan & 3) << 6) | (flen >> 11),
+        (flen >> 3) & 0xFF,
+        ((flen & 7) << 5) | 0x1F,
+        0xFC,
+    ])
+
+# One 1024-sample AAC-LC "digital silence" frame, 16 kHz mono, ADTS-framed. Fed into
+# ffmpeg's audio input whenever real camera audio is absent or gapped so the muxed
+# RTSP output never stalls waiting on the audio pipe.
+_AAC_SILENT_BLOCK = bytes.fromhex("211004608c1c")
+AAC_SILENCE_16K_MONO = _adts_header(len(_AAC_SILENT_BLOCK)) + _AAC_SILENT_BLOCK
+
 def _dump_rx(link, buf):
     """--discover diagnostics: log EVERY inbound reassembled frame verbatim, so a
     getDeviceList (9100) / dev_list reply is visible even if it arrives under a cmd
@@ -149,10 +167,18 @@ def build_openlive(user_id, channels):
 def build_startstream(user_id, channels, stream_id=1):
     # cmd 1003 (ic / startStream) — the ACTUAL live-video trigger (cmd 1103 is only a param query).
     chn_list = [{"index": i, "chn": c, "sensor": 1} for i, c in enumerate(channels)]
+    # audio_chn: -1 = no audio (historical default). Request audio for the streamed
+    # channel so the NVR also pushes an audio track. EUFY_NO_AUDIO=1 forces the old
+    # behaviour; EUFY_AUDIO_CHN overrides which channel's mic to request.
+    if os.environ.get("EUFY_NO_AUDIO") == "1":
+        audio_chn = -1
+    else:
+        audio_chn = int(os.environ.get("EUFY_AUDIO_CHN", channels[0] if channels else -1))
+    log(f"   startStream audio_chn={audio_chn}")
     payload = json.dumps({
         "account_id": user_id, "cmd": 1003,
         "payload": {"ClientOS": "WEB", "entrytype": 1, "camera_type": 0, "streamtype": 2,
-                    "key": "", "msg_id": "", "audio_chn": -1, "stitch_mode": 1, "chn_list": chn_list},
+                    "key": "", "msg_id": "", "audio_chn": audio_chn, "stitch_mode": 1, "chn_list": chn_list},
     }, separators=(",", ":")).encode()
     h = bytearray(16)
     h[0:4] = b"XZYH"
@@ -326,11 +352,14 @@ async def main():
     pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     chans = {}
     state = {"connected": False, "started": False, "vbytes": 0, "vframes": 0, "ptcs_in": 0,
-             "cmd_dc_open": False, "frames_seen": 0, "nvr_ip": None, "discovered": False}
+             "cmd_dc_open": False, "frames_seen": 0, "nvr_ip": None, "discovered": False,
+             "cmdcount": {}}
     dumpf = open(VIDEO_DUMP, "wb"); framelog = open(FRAMES_LOG, "w")
 
     # Pick the Annex-B sink: ffmpeg->RTSP (go2rtc), stdout (pipe), or a dump file.
     ffmpeg_proc = None
+    audio_wfd = None                                   # write end of the AAC pipe into ffmpeg
+    want_audio = bool(RTSP_URL) and os.environ.get("EUFY_NO_AUDIO") != "1"
     if RTSP_URL:
         # Transcode HEVC -> H.264 so Home Assistant / browsers can render the LIVE view.
         # (H.265 only shows the still thumbnail; most browsers can't play it live.) Set
@@ -345,18 +374,57 @@ async def main():
             vcodec = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                       "-pix_fmt", "yuv420p", "-g", "12", "-keyint_min", "12", "-sc_threshold", "0"]
             _codec_label = "H.264 (transcoded)"
+        # The input format is known, so probing only delays go2rtc publication. HA's
+        # camera proxy has a hard 10-second image timeout and the NVR's WebRTC
+        # handshake already consumes most of it on a cold start.
+        ff = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-fflags", "nobuffer",
+              "-probesize", "32", "-analyzeduration", "0",
+              "-thread_queue_size", "512", "-f", "hevc", "-r", "25", "-i", "pipe:0"]
+        pass_fds = ()
+        if want_audio:
+            # eufy cam audio (cmd 1301) is AAC-LC 16 kHz mono, ADTS-framed after its
+            # 16-byte media header -> feed it to ffmpeg as a 2nd input on an extra fd.
+            # Re-encode (not copy): the RTSP muxer rejects AAC-from-ADTS ("AAC with no
+            # global headers is currently not supported"); a fresh 16 kHz mono encode
+            # is cheap next to the H.264 video transcode and gives proper extradata.
+            # audio_keepalive() primes this pipe with silence so a missing/gapped
+            # audio track can't stall the output.
+            a_r, a_w = os.pipe()
+            os.set_inheritable(a_r, True)
+            os.set_blocking(a_w, False)
+            # -max_interleave_delta 0: with two live pipe inputs at different (and
+            # jittery) rates the muxer otherwise holds video packets waiting for
+            # audio to "catch up", and the video track stalls. Emit as they arrive.
+            ff += ["-thread_queue_size", "512", "-f", "aac", "-i", f"pipe:{a_r}",
+                   "-map", "0:v:0", "-map", "1:a:0", *vcodec,
+                   "-c:a", "aac", "-ar", "16000", "-ac", "1", "-b:a", "32k",
+                   "-max_interleave_delta", "0", "-muxdelay", "0", "-muxpreload", "0"]
+            pass_fds = (a_r,)
+        else:
+            ff += vcodec
+        ff += ["-rtsp_transport", "tcp", "-f", "rtsp", RTSP_URL]
         ffmpeg_proc = await asyncio.create_subprocess_exec(
-            FFMPEG, "-hide_banner", "-loglevel", "warning", "-fflags", "nobuffer",
-            # The input format is known, so probing only delays go2rtc publication.
-            # HA's camera proxy has a hard 10-second image timeout and the NVR's
-            # WebRTC handshake already consumes most of it on a cold start.
-            "-probesize", "32", "-analyzeduration", "0",
-            "-f", "hevc", "-r", "25", "-i", "pipe:",
-            *vcodec, "-rtsp_transport", "tcp", "-f", "rtsp", RTSP_URL,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL)
+            *ff, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE, pass_fds=pass_fds)
+
+        async def _ff_stderr():
+            # ffmpeg failures were invisible (stderr -> /dev/null); surface warn/error
+            # lines so a broken mux/pipe shows up instead of a silent exec restart.
+            _spam = ("deprecated pixel format used", "Could not find ref with POC",
+                     "not enough frames to estimate rate")
+            try:
+                async for ln in ffmpeg_proc.stderr:
+                    s = ln.decode("utf-8", "replace").rstrip()
+                    if s and not any(x in s for x in _spam):
+                        log("ffmpeg[stderr]:", s[:200])
+            except Exception:
+                pass
+        asyncio.ensure_future(_ff_stderr())
+        if want_audio:
+            os.close(a_r)                              # child owns the read end now
+            audio_wfd = a_w
         sink = ffmpeg_proc.stdin
-        log(f"ffmpeg publishing {_codec_label} -> {RTSP_URL}")
+        log(f"ffmpeg publishing {_codec_label}{' + AAC audio' if want_audio else ''} -> {RTSP_URL}")
     elif STDOUT_MODE:
         sink = sys.stdout.buffer
     else:
@@ -380,7 +448,8 @@ async def main():
         payload = buf[16:] if xz else buf
         if DISCOVER:
             _dump_rx(link, buf)
-        if cmdid in (1300, 1301, 1303):                      # VIDEO: strip 16B XZYH + 22B media hdr -> Annex-B
+        state["cmdcount"][cmdid] = state["cmdcount"].get(cmdid, 0) + 1
+        if cmdid == 1300:                                    # VIDEO: strip 16B XZYH + 22B media hdr -> Annex-B
             nal = payload[22:]
             state["vbytes"] += len(nal); state["vframes"] += 1
             try:
@@ -394,6 +463,22 @@ async def main():
             if state["vframes"] <= 20:
                 framelog.write(json.dumps({"video": True, "cmd": cmdid, "link": link, "n": state["vframes"],
                                            "plen": len(payload), "nal": payload[:24].hex()}) + "\n"); framelog.flush()
+        elif cmdid == 1301 and want_audio:                   # AUDIO: strip 16B media hdr -> AAC-LC ADTS
+            adts = payload[16:]
+            state["aframes"] = state.get("aframes", 0) + 1
+            state["abytes"] = state.get("abytes", 0) + len(adts)
+            state["a_last"] = time.time()
+            if audio_wfd is not None and adts[:1] == b"\xff":
+                try:
+                    os.write(audio_wfd, adts)
+                except BlockingIOError:
+                    pass                                     # ffmpeg behind; drop this frame
+                except Exception as e:
+                    if state["aframes"] % 250 == 1:
+                        log("audio pipe write err:", e)
+            if state["aframes"] <= 4 or state["aframes"] % 250 == 0:
+                log(f"AUDIO #{state['aframes']} cmd={cmdid} link={link} plen={len(payload)} "
+                    f"adts={adts[:7].hex()} total={state['abytes']}")
         elif cmdid == 1032:                                  # per-channel status (do NOT ack)
             chid = buf[12] if len(buf) > 12 else -1
             val = int.from_bytes(payload[:4], "little", signed=True) if len(payload) >= 4 else None
@@ -522,13 +607,28 @@ async def main():
         oracle.push_send(1, ss)
 
     async def stats_loop():
-        last = (0, 0)
+        last = (0, 0, 0)
         while True:
             await asyncio.sleep(4)
-            cur = (state["ptcs_in"], state["vframes"])
+            cur = (state["ptcs_in"], state["vframes"], state.get("aframes", 0))
             log(f"STATS ptcs_in={state['ptcs_in']} video={state['vframes']} vbytes={state['vbytes']} "
-                f"frames_seen={state['frames_seen']}  (+{cur[0]-last[0]} pkts, +{cur[1]-last[1]} vid /4s)")
+                f"audio={cur[2]} abytes={state.get('abytes', 0)} frames_seen={state['frames_seen']}  "
+                f"(+{cur[0]-last[0]} pkts, +{cur[1]-last[1]} vid, +{cur[2]-last[2]} aud /4s)  "
+                f"cmd={state['cmdcount']}")
             last = cur
+
+    async def audio_keepalive():
+        # Keep ffmpeg's AAC input fed with silence whenever real camera audio is
+        # absent or gapped, so the muxed RTSP output can't stall on the audio pipe.
+        if audio_wfd is None:
+            return
+        while True:
+            await asyncio.sleep(0.064)                        # ~one 1024-sample frame @ 16 kHz
+            if time.time() - state.get("a_last", 0) > 0.20:
+                try:
+                    os.write(audio_wfd, AAC_SILENCE_16K_MONO)
+                except (BlockingIOError, OSError):
+                    pass
 
     def maybe_start():
         if state["connected"] and state["cmd_dc_open"] and not state["started"]:
@@ -536,6 +636,7 @@ async def main():
             log(f"connected+DC open; user_id={USER_ID[:8]}.. heartbeat on; starting sequence")
             asyncio.ensure_future(heartbeat_loop())
             asyncio.ensure_future(stats_loop())
+            asyncio.ensure_future(audio_keepalive())
             asyncio.ensure_future(start_sequence())
 
     def attach(ch, mine):
@@ -651,6 +752,9 @@ async def main():
     await pc.close(); dumpf.close(); framelog.close()
     if oracle.proc:
         try: oracle.proc.terminate()
+        except Exception: pass
+    if audio_wfd is not None:
+        try: os.close(audio_wfd)
         except Exception: pass
     if ffmpeg_proc:
         try:
