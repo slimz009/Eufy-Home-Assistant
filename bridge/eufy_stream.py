@@ -108,13 +108,21 @@ def _dump_rx(link, buf):
     id or payload shape on_frame() doesn't currently match."""
     xz = buf[:4] == b"XZYH"
     off4 = (buf[4] | (buf[5] << 8)) if len(buf) >= 6 else -1   # inbound msg type / outbound envelope
-    chan = buf[12] if len(buf) > 12 else -1
     payload = buf[16:] if xz else buf
     split_txt = payload.split(b"\x00")[0].decode("utf-8", "replace")   # what on_frame() sees today
     j = payload.find(b"{")
     brace_txt = payload[j:].decode("utf-8", "replace") if j >= 0 else ""
-    log(f"RX link={link} xzyh={xz} off4={off4} chan={chan} len={len(buf)} "
-        f"plen={len(payload)} head={buf[:32].hex()}")
+    # Full XZYH header field breakdown (docs/PROTOCOL.md section 4).
+    if xz and len(buf) >= 16:
+        param_len = int.from_bytes(buf[6:10], "little")
+        hdr = (f"cmd_id={off4} param_len={param_len} segmen={buf[11]} "
+               f"channel_id={buf[12]} is_response={buf[14]} dev_type={buf[15]}")
+    else:
+        hdr = "(no XZYH header)"
+    p_i32 = int.from_bytes(payload[:4], "little", signed=True) if len(payload) >= 4 else None
+    log(f"RX link={link} len={len(buf)} plen={len(payload)} {hdr}")
+    log(f"   FULL FRAME HEX ({len(buf)}B): {buf.hex()}")
+    log(f"   payload[:4] as int32 LE = {p_i32}   payload nonzero bytes = {sum(1 for b in payload if b)}")
     if split_txt.strip():
         log(f"   split-decode: {split_txt[:500]!r}")
     if brace_txt and brace_txt != split_txt:
@@ -122,7 +130,7 @@ def _dump_rx(link, buf):
     low = payload.lower()
     if any(k in low for k in (b"dev_list", b"devlist", b'"cmd":9100', b'"cmd": 9100',
                               b'"sn"', b'"name"', b'"ch"', b'"status"', b'"channel"')):
-        log(f"   >>> POSSIBLE DEVICE-LIST FRAME <<< full payload hex:\n{payload.hex()}")
+        log(f"   >>> POSSIBLE DEVICE-LIST FRAME <<<")
 
 def build_openlive(user_id, channels):
     payload = json.dumps({
