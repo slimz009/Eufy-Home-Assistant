@@ -402,6 +402,21 @@ async def main():
             if n < 12:
                 state["st1032"] = n + 1; log(f"status cmd1032 ch={chid} val={val}")
         else:                                                # control responses (1351 params, 1003/1004 acks, 9100)
+            # Fixed-size status/error reply: a 4-byte int32 result code + zero padding,
+            # NOT the JSON docs/PROTOCOL.md describes. Firmware sends this to reject a
+            # command outright (observed: STATUS=-104 for openLive/getDeviceList when the
+            # signed-in eufy account isn't the NVR's owner/admin). Decode it explicitly so
+            # it reads as an error, not a mystery "failed JSON parse".
+            if (len(payload) >= 4 and not any(payload[4:])
+                    and any(b < 0x20 or b > 0x7e for b in payload[:4])):
+                status = int.from_bytes(payload[:4], "little", signed=True)
+                log(f"CTRL cmd={cmdid} link={link} len={len(buf)} ERROR STATUS={status} "
+                    f"(fixed {len(payload)}B status reply, no JSON payload)")
+                framelog.write(json.dumps({"ctrl": True, "cmd": cmdid, "link": link,
+                    "len": len(buf), "error_status": status}) + "\n"); framelog.flush()
+                if DISCOVER:
+                    state.setdefault("disc_errs", []).append(status)
+                return
             try: txt = payload.split(b"\x00")[0].decode("utf-8", "replace")
             except Exception: txt = ""
             _j = payload.find(b"{")
@@ -643,6 +658,15 @@ async def main():
         except Exception: pass
     log(f"DONE. video frames={state['vframes']} bytes={state['vbytes']} ptcs_in={state['ptcs_in']} "
         f"frames_seen={state['frames_seen']}")
+    if DISCOVER and not state["discovered"]:
+        errs = state.get("disc_errs") or []
+        if errs and all(e == errs[0] for e in errs):
+            log(f"discovery: the NVR rejected every command with ERROR STATUS={errs[0]} "
+                f"(no camera list returned). If this is -104, the signed-in eufy account "
+                f"is most likely a shared/member user, not the NVR's owner/admin — retry "
+                f"with the account that set up the NVR.")
+        elif errs:
+            log(f"discovery: NVR returned error statuses {errs} and no camera list.")
     # In --discover mode only a written manifest counts as success. Returning this lets
     # the caller (the add-on run.sh) tell a real discovery from one that merely timed
     # out — otherwise it logs "Discovery OK" and gen_go2rtc.py dies on a missing file.
