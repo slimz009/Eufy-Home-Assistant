@@ -398,9 +398,13 @@ async def main():
             except Exception: txt = ""
             _j = payload.find(b"{")
             cand = payload[_j:].decode("utf-8", "replace") if _j >= 0 else txt
-            _devlist_hit = any(s in cand for s in ('"dev_list"', '"devList"', '"cmd":9100', '"cmd": 9100')) \
-                or '"dev_list"' in txt
-            if DISCOVER and _devlist_hit and not state["discovered"]:
+            if DISCOVER and cand.strip().startswith("{"):
+                log(f"CTRL-JSON cmd={cmdid} link={link} len={len(buf)}: {cand[:2500]}")
+            _hit = any(s in cand for s in (
+                '"dev_list"', '"devList"', '"cmd":9100', '"cmd": 9100',
+                '"cmd":1103', '"cmd": 1103', '"channel_list"', '"channel_info"',
+                '"camera_params"', '"nickname"', '"device_name"', '"dev_name"'))
+            if DISCOVER and _hit and not state["discovered"]:
                 handle_devlist(cand)
             else:
                 log(f"CTRL cmd={cmdid} link={link} len={len(buf)} {(cand or txt)[:300]}")
@@ -411,16 +415,36 @@ async def main():
         try:
             obj = json.loads(txt)
         except Exception as e:
-            log("devlist parse err:", e, "| raw:", repr(txt[:400])); return
+            log("discovery json parse err:", e, "| raw:", repr(txt[:400])); return
         pl = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
         dl = pl.get("dev_list") or pl.get("devList") or obj.get("dev_list") or obj.get("devList") or []
-        if not dl:
-            # Diagnostic: a 9100 reply arrived but carried no devices. Log the whole
-            # object and keep discovery "unfinished" so run.sh retries and we see it again.
-            log(f"9100 reply had NO devices; full obj = {json.dumps(obj)[:800]}")
+        if dl:
+            cams = [{"channel": d.get("ch"), "name": d.get("name"), "sn": d.get("sn"),
+                     "status": d.get("status"), "dev_type": d.get("dev_type")} for d in dl]
+        else:
+            # 1103 / getCameraParams shape is unknown across firmwares: recursively scan
+            # for any dict that pairs a channel number with a name.
+            found = {}
+            def walk(o):
+                if isinstance(o, dict):
+                    ch = o.get("chn", o.get("ch", o.get("channel", o.get("channel_id"))))
+                    nm = (o.get("name") or o.get("nickname") or o.get("device_name")
+                          or o.get("dev_name") or o.get("camera_name"))
+                    if isinstance(ch, int) and nm:
+                        found.setdefault(ch, {
+                            "channel": ch, "name": nm,
+                            "sn": o.get("sn") or o.get("device_sn") or o.get("dev_sn"),
+                            "status": o.get("status"), "dev_type": o.get("dev_type")})
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+            walk(obj)
+            cams = [found[k] for k in sorted(found)]
+        if not cams:
+            log(f"discovery reply had no usable camera entries; full obj = {json.dumps(obj)[:1500]}")
             return
-        cams = [{"channel": d.get("ch"), "name": d.get("name"), "sn": d.get("sn"),
-                 "status": d.get("status"), "dev_type": d.get("dev_type")} for d in dl]
         manifest = {"nvr_sn": STATION_SN, "nvr_ip": state["nvr_ip"], "cameras": cams}
         out = CAMERAS_JSON
         # Write-then-rename (like auth_login.py) so gen_go2rtc.py, or a fallback that
@@ -449,8 +473,16 @@ async def main():
 
     async def start_sequence():
         if DISCOVER:
+            # cmd 9100 (getDeviceList) is undocumented and this NVR firmware rejects it
+            # with error -104. cmd 1103 (openLive / getCameraParams) IS documented to
+            # return a params JSON with camera names and does NOT start video, so try it
+            # first; keep 9100 as a fallback for firmware that supports it.
+            ol = build_openlive(USER_ID, CHANNELS)
+            log(f"-> openLive (1103) len={len(ol)} channels={CHANNELS}  [auto-discovery via getCameraParams]")
+            oracle.push_send(1, ol)
+            await asyncio.sleep(0.4)
             dl = build_devicelist(USER_ID)
-            log(f"-> getDeviceList (9100) len={len(dl)}  [auto-discovery]")
+            log(f"-> getDeviceList (9100) len={len(dl)}  [auto-discovery fallback]")
             oracle.push_send(1, dl)
             return
         # openLive (1103) param query, then the REAL trigger startStream (1003).
