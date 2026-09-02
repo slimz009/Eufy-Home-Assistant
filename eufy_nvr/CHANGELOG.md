@@ -1,3 +1,7 @@
+## 0.6.9
+
+- fix(build): tolerate the eufy NVR's malformed DTLS certificate (cryptography>=43 ExtraData parse error) by fingerprinting the raw DER in aiortc's _validate_peer_identity.
+
 # Changelog
 
 ## 0.6.8
