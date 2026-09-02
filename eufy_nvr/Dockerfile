@@ -66,7 +66,7 @@ RUN if [ ! -e /usr/bin/python ]; then ln -s /usr/bin/python3 /usr/bin/python; fi
 ARG REPO_URL="https://github.com/slimz009/Eufy-Home-Assistant"
 ARG REPO_REF="test/local-build"
 # Bump CACHEBUST to force a fresh clone when the branch HEAD moves (local testing only).
-ARG CACHEBUST=12
+ARG CACHEBUST=13
 RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /tmp/repo \
     && git -C /tmp/repo rev-parse HEAD \
     && mkdir -p /opt/eufy \
@@ -79,6 +79,13 @@ WORKDIR /opt/eufy/bridge
 # (PEP 668) environment; we are the only app in this container so installing into the
 # system site-packages is fine and avoids a venv indirection for the go2rtc exec calls.
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt paho-mqtt
+
+# The eufy NVR's self-signed DTLS cert is malformed; cryptography>=43 refuses to
+# parse it, which aborts every WebRTC datachannel (discovery + livestream) with
+# "error parsing asn1 value ... TbsCertificate::signature_alg". Patch aiortc to
+# fingerprint the raw DER instead of parsing the cert. Version-independent.
+COPY aiortc_lenient_dtls_cert.py /tmp/aiortc_lenient_dtls_cert.py
+RUN python3 /tmp/aiortc_lenient_dtls_cert.py && rm /tmp/aiortc_lenient_dtls_cert.py
 
 # Fetch runtime binaries the engine needs:
 #   - eufy libsctp WASM + worker shims  -> bridge/worker/   (from eufy's public CDN)
