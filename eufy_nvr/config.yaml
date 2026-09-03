@@ -1,5 +1,5 @@
 name: Eufy NVR Local (experimental)
-version: "0.6.9"
+version: "0.6.10"
 slug: eufy_nvr
 description: Local live video from a eufy PoE NVR (S4 / T8N00) over reversed WebRTC, served as RTSP/WebRTC for Home Assistant. No cloud media, no Frigate.
 url: https://github.com/HallyAus/Eufy-Home-Assistant
@@ -61,6 +61,7 @@ options:
   keep_warm: false
   token_refresh_hours: 6
   video_copy: false
+  start_timeout: 90
 schema:
   email: str
   password: password
@@ -76,6 +77,11 @@ schema:
   # video_copy: publish raw H.265 instead of transcoding to H.264 (lower CPU, but the browser live
   #   view shows the still thumbnail only). Pair with keep_warm for a low-CPU always-on warm.
   video_copy: bool?
+  # start_timeout: seconds go2rtc waits for a camera's producer to come up before "[exec] timeout".
+  #   go2rtc's own default is 30s; a cold WebRTC start via the eufy cloud's scall/turn signaling
+  #   often needs 35-60s (more when the cloud is slow/rate-limited), so on-demand pulls fail at 30s.
+  #   Raise if live view still times out on first open; lower toward 30 only if the cloud is fast.
+  start_timeout: int(30,)?
   station_sn: str?
   captcha_id: str?
   captcha_answer: str?

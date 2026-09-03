@@ -1,3 +1,13 @@
+## 0.6.10
+
+- fix(stream): raise go2rtc's exec-producer wait from its hardcoded 30s default. A cold WebRTC
+  start via the eufy cloud's `scall/turn` signaling routinely needs 35-60s (more when the cloud is
+  slow or rate-limited), so on-demand live view failed spuriously with `[exec] timeout` and no SDP
+  offer. `gen_go2rtc.py` now emits `#starttimeout=` on each stream (new `start_timeout` option,
+  default 90s, floor 30); go2rtc bumped to v1.9.14 for that query param.
+- fix(build): reference `${CACHEBUST}` inside the bridge-clone `RUN` so bumping it actually
+  invalidates the layer (it previously did nothing — a rebuild reused the stale clone).
+
 ## 0.6.9
 
 - fix(build): tolerate the eufy NVR's malformed DTLS certificate (cryptography>=43 ExtraData parse error) by fingerprinting the raw DER in aiortc's _validate_peer_identity.

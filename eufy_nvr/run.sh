@@ -21,6 +21,15 @@ CONFIG_PATH="${STATE_DIR}/go2rtc.yaml"
 export GO2RTC_API_PORT="1985"
 export GO2RTC_RTSP_PORT="8556"
 export GO2RTC_WEBRTC_PORT="8557"
+# How long go2rtc's exec source waits for a camera producer before "[exec] timeout".
+# gen_go2rtc.py bakes this into each stream as `#starttimeout=`; a cold eufy scall/turn
+# WebRTC start regularly exceeds go2rtc's 30s default. Operator-tunable, floor 30.
+EUFY_GO2RTC_START_TIMEOUT="$(bashio::config 'start_timeout' '90')"
+if ! [ "${EUFY_GO2RTC_START_TIMEOUT}" -ge 30 ] 2>/dev/null; then
+    bashio::log.warning "start_timeout='${EUFY_GO2RTC_START_TIMEOUT}' invalid/<30; using 90."
+    EUFY_GO2RTC_START_TIMEOUT="90"
+fi
+export EUFY_GO2RTC_START_TIMEOUT
 mkdir -p "${STATE_DIR}"
 cd "${BRIDGE_DIR}"
 

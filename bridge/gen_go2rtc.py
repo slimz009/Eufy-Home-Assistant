@@ -21,6 +21,19 @@ BRIDGE_IP = os.environ.get(
 API_PORT = int(os.environ.get("GO2RTC_API_PORT", "1984"))
 RTSP_PORT = int(os.environ.get("GO2RTC_RTSP_PORT", "8554"))
 WEBRTC_PORT = int(os.environ.get("GO2RTC_WEBRTC_PORT", "8555"))
+# go2rtc's exec source waits this long (seconds) for eufy_stream.py's ffmpeg to
+# publish back into the internal RTSP ingest before it kills the process with
+# "[exec] timeout". go2rtc's built-in default is 30s (hardcoded pre-1.9.10,
+# `#starttimeout=` query param from 1.9.10+). A cold WebRTC start against the eufy
+# cloud's scall/turn signaling routinely needs 35-60s when the cloud is slow or
+# rate-limited, so 30s makes on-demand streams fail spuriously. Bump it via
+# `#starttimeout=` (needs go2rtc >= 1.9.10). Override with EUFY_GO2RTC_START_TIMEOUT.
+try:
+    START_TIMEOUT = int(os.environ.get("EUFY_GO2RTC_START_TIMEOUT", "90"))
+except ValueError:
+    START_TIMEOUT = 90
+if START_TIMEOUT < 30:
+    START_TIMEOUT = 30
 try:
     with open(CAMERAS_JSON) as _f:
         cams = json.load(_f)
@@ -54,7 +67,8 @@ lines = [
 ]
 for name, c in online:
     lines.append(
-        f'  {name}: "exec:python eufy_stream.py {c["channel"]} --rtsp {{output}}"'
+        f'  {name}: "exec:python eufy_stream.py {c["channel"]} --rtsp {{output}}'
+        f'#starttimeout={START_TIMEOUT}"'
     )
 lines += [
     "",

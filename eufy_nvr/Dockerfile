@@ -2,7 +2,9 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # go2rtc version is injected from build.yaml (args:) so the build is reproducible (no "latest").
-ARG GO2RTC_VERSION="v1.9.9"
+# >= 1.9.10 for the `#starttimeout=` exec-source query param (gen_go2rtc.py sets it so a slow
+# eufy scall/turn cold start doesn't hit go2rtc's hardcoded 30s "[exec] timeout").
+ARG GO2RTC_VERSION="v1.9.14"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -66,8 +68,10 @@ RUN if [ ! -e /usr/bin/python ]; then ln -s /usr/bin/python3 /usr/bin/python; fi
 ARG REPO_URL="https://github.com/slimz009/Eufy-Home-Assistant"
 ARG REPO_REF="test/local-build"
 # Bump CACHEBUST to force a fresh clone when the branch HEAD moves (local testing only).
-ARG CACHEBUST=13
-RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /tmp/repo \
+# It MUST be referenced inside the RUN below or Docker reuses the cached (stale) clone layer.
+ARG CACHEBUST=14
+RUN echo "cachebust=${CACHEBUST}" \
+    && git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /tmp/repo \
     && git -C /tmp/repo rev-parse HEAD \
     && mkdir -p /opt/eufy \
     && cp -r /tmp/repo/bridge /opt/eufy/bridge \

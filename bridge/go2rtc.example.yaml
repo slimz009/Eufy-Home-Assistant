@@ -4,12 +4,16 @@
 #
 # {output} is replaced by go2rtc with an internal RTSP ingest URL; eufy_stream.py spawns ffmpeg to publish there.
 # Adjust the python path / channel numbers / names to taste. Channels are 0..3.
+#
+# #starttimeout=90 raises go2rtc's exec-producer wait from its 30s default (needs go2rtc >= 1.9.10).
+# A cold WebRTC start via the eufy cloud's scall/turn signaling often needs 35-60s when the cloud is
+# slow/rate-limited; 30s makes on-demand pulls fail with "[exec] timeout".
 
 streams:
-  eufy_garage: "exec:python eufy_stream.py 0 --rtsp {output}"
-  eufy_ch1:    "exec:python eufy_stream.py 1 --rtsp {output}"
-  eufy_ch2:    "exec:python eufy_stream.py 2 --rtsp {output}"
-  eufy_ch3:    "exec:python eufy_stream.py 3 --rtsp {output}"
+  eufy_garage: "exec:python eufy_stream.py 0 --rtsp {output}#starttimeout=90"
+  eufy_ch1:    "exec:python eufy_stream.py 1 --rtsp {output}#starttimeout=90"
+  eufy_ch2:    "exec:python eufy_stream.py 2 --rtsp {output}#starttimeout=90"
+  eufy_ch3:    "exec:python eufy_stream.py 3 --rtsp {output}#starttimeout=90"
 
 rtsp:
   listen: ":8554"
